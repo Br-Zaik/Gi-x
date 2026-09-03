@@ -1,0 +1,76 @@
+name: Compilar GI X APK desde ZIP
+
+on:
+  push:
+    paths:
+      - "*.zip"
+      - "incoming/*.zip"
+  workflow_dispatch:
+
+jobs:
+  compilar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repo
+        uses: actions/checkout@v4
+
+      - name: Buscar ZIP
+        shell: bash
+        run: |
+          ZIP_FILE=$(ls -t *.zip incoming/*.zip 2>/dev/null | head -n 1 || true)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No se encontró ningún ZIP en la raíz ni en incoming/."
+            exit 1
+          fi
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "ZIP encontrado: $ZIP_FILE"
+
+      - name: Descomprimir ZIP
+        shell: bash
+        run: |
+          rm -rf temp_zip
+          mkdir temp_zip
+          unzip -o "$ZIP_FILE" -d temp_zip
+
+      - name: Buscar proyecto Android
+        shell: bash
+        run: |
+          PROJECT_DIR=$(find temp_zip -name "settings.gradle" -exec dirname {} \; | head -n 1)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "No se encontró settings.gradle dentro del ZIP."
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proyecto: $PROJECT_DIR"
+
+      - name: Copiar proyecto
+        shell: bash
+        run: rsync -a "$PROJECT_DIR"/ ./
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Android 34
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Gradle 8.6
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.6'
+
+      - name: Compilar APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GI-X-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
