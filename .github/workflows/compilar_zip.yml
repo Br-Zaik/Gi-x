@@ -54,11 +54,34 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Android SDK del runner
+        shell: bash
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-}"
+          if [ -z "$SDK_DIR" ]; then SDK_DIR="${ANDROID_HOME:-}"; fi
+          if [ -z "$SDK_DIR" ]; then SDK_DIR="/usr/local/lib/android/sdk"; fi
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "No se encontró el Android SDK del runner en $SDK_DIR"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "sdk.dir=$SDK_DIR" > local.properties
+          echo "SDK en uso: $SDK_DIR"
+          ls "$SDK_DIR/platforms" 2>/dev/null || echo "sin platforms preinstaladas"
+          ls "$SDK_DIR/build-tools" 2>/dev/null || echo "sin build-tools preinstaladas"
 
-      - name: Instalar Android 34
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: Licencias y paquetes (avisos, nunca cortan la compilación)
+        shell: bash
+        run: |
+          SDKMANAGER="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager no disponible; Gradle descargará lo que falte."
+            exit 0
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || echo "Aviso: --licenses devolvió error; se continúa."
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || echo "Aviso: no se pudo instalar android-34/build-tools; Gradle lo intentará."
 
       - name: Gradle 8.6
         uses: gradle/actions/setup-gradle@v4
@@ -66,7 +89,11 @@ jobs:
           gradle-version: '8.6'
 
       - name: Compilar APK
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Tamaño de la APK
+        shell: bash
+        run: ls -lh app/build/outputs/apk/debug/app-debug.apk
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
