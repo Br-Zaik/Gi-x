@@ -13,91 +13,146 @@ jobs:
 
     steps:
       - name: Descargar repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
-      - name: Buscar ZIP
+      - name: Elegir el ZIP correcto
         shell: bash
         run: |
-          ZIP_FILE=$(ls -t *.zip incoming/*.zip 2>/dev/null | head -n 1 || true)
+          set -euo pipefail
+          ZIP_FILE=""
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            ZIP_FILE=$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$GITHUB_SHA" \
+              | grep -E '^(incoming/)?[^/]+\.zip$' \
+              | tail -n 1 || true)
+          fi
+
           if [ -z "$ZIP_FILE" ]; then
-            echo "No se encontró ningún ZIP en la raíz ni en incoming/."
+            ZIP_FILE=$(git log --diff-filter=AM --name-only --pretty=format: -- '*.zip' 'incoming/*.zip' \
+              | grep -E '^(incoming/)?[^/]+\.zip$' \
+              | head -n 1 || true)
+          fi
+
+          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: no se encontró un ZIP válido para compilar."
+            find . -maxdepth 2 -type f -name '*.zip' -print || true
             exit 1
           fi
+
           echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
-          echo "ZIP encontrado: $ZIP_FILE"
+          echo "COMPILANDO EXACTAMENTE: $ZIP_FILE"
+          sha256sum "$ZIP_FILE"
 
       - name: Descomprimir ZIP
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf temp_zip
           mkdir temp_zip
-          unzip -o "$ZIP_FILE" -d temp_zip
+          unzip -t "$ZIP_FILE"
+          unzip -q -o "$ZIP_FILE" -d temp_zip
 
       - name: Buscar proyecto Android
         shell: bash
         run: |
-          PROJECT_DIR=$(find temp_zip -name "settings.gradle" -exec dirname {} \; | head -n 1)
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "No se encontró settings.gradle dentro del ZIP."
+          set -euo pipefail
+          SETTINGS=$(find temp_zip -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1 || true)
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: el ZIP no contiene settings.gradle/settings.gradle.kts."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "ERROR: no se encontró app/build.gradle dentro del proyecto."
             exit 1
           fi
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Proyecto: $PROJECT_DIR"
+          echo "Proyecto Android: $PROJECT_DIR"
 
-      - name: Copiar proyecto
+      - name: Copiar proyecto limpio
         shell: bash
-        run: rsync -a "$PROJECT_DIR"/ ./
+        run: |
+          set -euo pipefail
+          rsync -a --exclude '.git/' --exclude 'temp_zip/' "$PROJECT_DIR"/ ./
 
       - name: Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK del runner
+      - name: Preparar Android SDK
         shell: bash
         run: |
-          SDK_DIR="${ANDROID_SDK_ROOT:-}"
-          if [ -z "$SDK_DIR" ]; then SDK_DIR="${ANDROID_HOME:-}"; fi
-          if [ -z "$SDK_DIR" ]; then SDK_DIR="/usr/local/lib/android/sdk"; fi
+          set -euo pipefail
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           if [ ! -d "$SDK_DIR" ]; then
-            echo "No se encontró el Android SDK del runner en $SDK_DIR"
+            echo "ERROR: Android SDK no encontrado en $SDK_DIR"
             exit 1
           fi
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
           echo "sdk.dir=$SDK_DIR" > local.properties
-          echo "SDK en uso: $SDK_DIR"
-          ls "$SDK_DIR/platforms" 2>/dev/null || echo "sin platforms preinstaladas"
-          ls "$SDK_DIR/build-tools" 2>/dev/null || echo "sin build-tools preinstaladas"
 
-      - name: Licencias y paquetes (avisos, nunca cortan la compilación)
-        shell: bash
-        run: |
-          SDKMANAGER="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager no disponible; Gradle descargará lo que falte."
-            exit 0
+          SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" >/dev/null
           fi
-          echo "sdkmanager: $SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || echo "Aviso: --licenses devolvió error; se continúa."
-          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || echo "Aviso: no se pudo instalar android-34/build-tools; Gradle lo intentará."
 
       - name: Gradle 8.6
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.6'
 
-      - name: Compilar APK
-        run: gradle --no-daemon :app:assembleDebug --stacktrace
-
-      - name: Tamaño de la APK
+      - name: Compilar APK limpia
         shell: bash
-        run: ls -lh app/build/outputs/apk/debug/app-debug.apk
+        run: |
+          set -euo pipefail
+          gradle --no-daemon clean :app:assembleDebug --stacktrace
 
-      - name: Subir APK
-        uses: actions/upload-artifact@v4
+      - name: Verificar que la APK sea instalable
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+
+          echo "===== INFORMACIÓN APK ====="
+          "$AAPT" dump badging "$APK" | grep -E "^(package:|sdkVersion:|targetSdkVersion:|native-code:)" || true
+
+          echo "===== FIRMA APK ====="
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+          echo "===== ALINEACIÓN APK ====="
+          "$ZIPALIGN" -c -v 4 "$APK"
+
+          echo "===== TAMAÑO / SHA256 ====="
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+          mkdir -p salida
+          cp "$APK" salida/GI-X-v1.6.23-debug.apk
+
+          echo "===== RESUMEN FINAL ====="
+          echo "ZIP fuente: $ZIP_FILE"
+          echo "APK: GI-X-v1.6.23-debug.apk"
+          "$AAPT" dump badging "$APK" | grep -E "^(package:|sdkVersion:|targetSdkVersion:|native-code:)" || true
+          sha256sum "$APK"
+
+      # v7 permite publicar un solo archivo SIN envolverlo en otro ZIP.
+      # En el celular se descarga directamente GI-X-v1.6.23-debug.apk.
+      - name: Subir APK directa
+        uses: actions/upload-artifact@v7
         with:
-          name: GI-X-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: salida/GI-X-v1.6.23-debug.apk
           if-no-files-found: error
+          archive: false
